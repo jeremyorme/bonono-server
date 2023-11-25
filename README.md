@@ -1,2 +1,2 @@
 # bonono-server
-Web server hosting bonono database
+Web server hosting mongo database
