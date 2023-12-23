@@ -11,7 +11,7 @@ app.use(express.urlencoded({extended: false}));
 const dbManager = new DbManager();
 
 app.get('/', (req, res) => {
-    res.send('This is a bonono database server!');
+    res.send('This is a p2p database server!');
 });
 
 // Post one or more signed entries into a collection and return their ids
@@ -26,11 +26,25 @@ app.get('/collection/:name/:publicKey', async (req, res) => {
     res.send(result);
 });
 
+// Post one or more signed entries into a public collection and return their ids
+app.post('/collection/:name', async (req, res) => {
+    const result = await dbManager.insertOne(req.params.name, null, req.body);
+    res.send(result);
+});
+
+// Get a range of entries from a public collection
+app.get('/collection/:name', async (req, res) => {
+    const result = await dbManager.find(req.params.name, null, req.body);
+    res.send(result);
+});
+
 (async () => {
-    const port = await portfinder.getPortPromise({startPort:3000});
+    const port = await portfinder.getPortPromise({port:3000});
     app.listen(port, () => {
         console.log(`The http server is listening on port ${port}!`);
-        dbManager.connect('mongodb://localhost:27017/music');
+
+        const peerAddresses = ['localhost:5000', 'localhost:5001'];
+        dbManager.connect(`mongodb://localhost:27017/music-${port}`, peerAddresses);
 
         // Client code examples...
 
@@ -50,6 +64,7 @@ app.get('/collection/:name/:publicKey', async (req, res) => {
 
         // Create a signed entry
         const entry = {
+            _id: 'bc1574acbd07cd903918b9dbed20936dedde9a8a34551cf3e932de527c881a17/0',
             _clock: 0,
             _signature: '',
             artist: 'Air',

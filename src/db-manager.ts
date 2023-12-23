@@ -1,13 +1,8 @@
 import { MongoClient, OptionalId, Filter, Document, Db } from 'mongodb';
 import { ed25519 } from '@noble/curves/ed25519';
 import * as utils from '@noble/curves/abstract/utils';
-import { Libp2p, createLibp2p } from 'libp2p';
-import { noise } from '@chainsafe/libp2p-noise';
-import { yamux } from '@chainsafe/libp2p-yamux';
-import { gossipsub } from '@chainsafe/libp2p-gossipsub';
-import { mdns } from '@libp2p/mdns';
-import { tcp } from '@libp2p/tcp';
-import { kadDHT } from '@libp2p/kad-dht';
+import * as net from 'net';
+import portfinder from 'portfinder';
 
 function errorMessage(error: any) {
     return error.message ? error.message : 'Unknown error';
@@ -16,10 +11,11 @@ function errorMessage(error: any) {
 export class DbManager
 {
     private _db: Db | null = null;
-    private _libp2p: Libp2p | null = null;
-    private _publish: (msg: any) => void = (msg: any) => console.log('Failed to publish: ', msg);
+    private _server: net.Server | null = null;
+    private _serverPort: number = 0;
+    private _clients: Map<string, net.Socket> = new Map();
         
-    async connect(dbAddress: string) {
+    async connect(dbAddress: string, peerAddresses: string[]) {
         const m = dbAddress.match(/(.*)\/(.*)\/?/);
         const uri = m?.at(1);
         const dbName = m?.at(2);
@@ -40,63 +36,130 @@ export class DbManager
             console.log(`Error while connecting to database '${dbAddress}': ${errorMessage(error)}`);
             return;
         }
-
-        try {
-            const libp2p = await createLibp2p({
-                addresses: { listen: ['/ip4/127.0.0.1/tcp/0'] },
-                transports: [tcp()],
-                connectionEncryption: [noise()],
-                streamMuxers: [yamux()],
-                peerDiscovery: [mdns()],
-                // peerDiscovery: [mdns(), bootstrap({list:[
-                //     '/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb',
-                //     '/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN']})],
-                services: { dht: kadDHT(), pubsub: gossipsub() }
-            });
-            this._libp2p = libp2p;
-
-            libp2p.addEventListener('peer:discovery', (peerInfo: any) => {
-                console.log(`Found peer: ${peerInfo.detail.id}`);
-            });
-
-            libp2p.addEventListener('peer:connect', (peerId: any) => {
-                console.log(`Connected to: ${peerId.detail}`);
-            });
-
-            libp2p.services.pubsub.addEventListener('message', (message: any) => {
-                console.log(`${message.detail.topic}: `, new TextDecoder().decode(message.detail.data));
-            });
         
-            console.log('Listening on addresses:');
-            libp2p.getMultiaddrs().forEach((addr) => {
-                console.log(addr.toString());
+        this._serverPort = await portfinder.getPortPromise({port: 5000});
+
+        this._server = net.createServer(socket => {
+            this._onPeerConnected(socket);
+
+            socket.on('data', msg => {
+                try {
+                    const json = new TextDecoder().decode(msg);
+                    const obj = JSON.parse(json);
+                    this._onPeerReceived(obj)
+                }
+                catch (error: any) {
+                    console.log(error);
+                }
             });
-              
-            libp2p.services.pubsub.subscribe('fruit');
-            
-            this._publish = (msg: any) => {
-                libp2p.services.pubsub.publish('fruit', new TextEncoder().encode(msg));
-                console.log('Published message: ', msg);
-            }
-        }
-        catch (error: any) {
-            console.error(error);
-        }
+
+            socket.on('end', () => {
+                this._onPeerDisconnected(socket);
+            });
+
+            socket.on('error', console.log);
+        });
+
+        this._server.on('error', console.log);
+        this._server.listen(this._serverPort, () => {
+            this._onListening();
+        });
+
+        this._tryConnectToPeers(peerAddresses);
     }
 
     async disconnect() {
-        if (!this._libp2p) {
-            console.log('Attempt to disconnect before connection');
-            return;
+        for (const [_, socket] of this._clients) {
+            socket.end();
         }
-        await this._libp2p.stop();
-        console.log('The libp2p node has stopped');
+        this._server?.close();
     };
 
+    private _tryConnectToPeers(addresses: string[]) {
+        if (this._clients.size < addresses.length)
+        {
+            for (const address of addresses) {
+                this._tryConnectToPeer(address);
+            }
+        }
+
+        setTimeout(() => this._tryConnectToPeers(addresses), 5000);
+    }
+
+    private _tryConnectToPeer(address: string) {
+        if (this._clients.has(address)) {
+            console.log(`Already connected to: ${address}`);
+            return;
+        }
+        const [host, portStr] = address.split(':');
+        const port = parseInt(portStr);
+        if (host == 'localhost' && port == this._serverPort) {
+            console.log('Skipping attempt to connect to self');
+            return;
+        }
+        const socket = net.createConnection(port, host, () => {
+            this._onPeerConnected(socket);
+            this._clients.set(address, socket);
+        });
+
+        socket.on('close', () => {
+            this._onPeerDisconnected(socket);
+            this._clients.delete(address);
+        });
+
+        socket.on('error', console.log);
+    }
+
+    private _sendToPeers(obj: any) {
+        const json = JSON.stringify(obj);
+        const buffer = new TextEncoder().encode(json);
+        for (const [_, socket] of this._clients) {
+            socket.write(buffer);
+        }
+    }
+
+    private _onListening() {
+        console.log(`Listening for peers on port ${this._serverPort}`);
+    }
+
+    private _onPeerConnected(socket: net.Socket) {
+        console.log(`Peer connected on port ${socket.localPort}/${socket.remotePort}`);
+    }
+
+    private _onPeerDisconnected(socket: net.Socket) {
+        console.log('Peer disconnected');
+    }
+
+    private _onPeerReceived(obj: any) {
+        console.log('Received data');
+        console.log(obj);
+
+        switch (obj.action) {
+            case 'insertOne':
+                {
+                    const {name, publicKey, entry} = obj;
+                    this.insertOne(name, publicKey, entry, false);
+                }
+                break;
+        }
+    }
+
     // Insert single entry into collection with specified address
-    async insertOne(name: string, publicKey: string, entry: OptionalId<Document>) {
+    async insertOne(name: string, publicKeyOwner: string | null, entry: OptionalId<Document>, notifyPeers: boolean = true) {
         if (!this._db) {
             console.log(`Attempt to insert entry into collection '${name}' before connection`);
+            return null;
+        }
+
+        if (!entry._id && entry._id != 0) {
+            console.log(`Attempt to insert entry into collection '${name}' without _id`);
+            return null;
+        }
+
+        const id = entry._id.toString();
+        const publicKey = publicKeyOwner || (id.match(/^[0-9a-f]+\//) ? id.split('/')[0] : null);
+        if (!publicKey) {
+            console.log(`Attempt to insert entry into public collection '${name}' without public key prefix on _id`);
             return null;
         }
 
@@ -106,28 +169,20 @@ export class DbManager
                 entry._signature,
                 utils.bytesToHex(new TextEncoder().encode(JSON.stringify({...entry, _signature: ''}))),
                 publicKey)) {
-                console.log(`Attempt to insert entry with signature that does not match the owner pubic key, into collection '${name}'`);
+                console.log(`Failed to verify entry signature '${entry._signature}' using owner pubic key '${publicKey}', for collection '${name}'`);
                 return null;
             }
         }
         catch (error: any)
         {
-            console.log(`Attempt to insert entry into collection '${name}' failed signature verification: ${errorMessage(error)}`);
+            console.log(`Exception while verifying entry signature '${entry._signature}' using owner pubic key '${publicKey}', for collection '${name}': ${errorMessage(error)}`);
             return null;
         }
 
-        const address = `${name}/${publicKey}`;
+        const address = publicKeyOwner ? `${name}/${publicKeyOwner}` : name;
 
         try {
             const col = this._db.collection(address);
-
-            col.createIndex({ _clock: 1 });
-            const last_entry = (await col.find().sort({ _clock: -1 }).limit(1).toArray())[0];
-            const next_clock = last_entry ? last_entry._clock + 1 : 0;
-            if (entry._clock != next_clock) {
-                console.log(`Attempt to insert entry with invalid clock into collection '${name}'`);
-                return null;
-            }
         
             console.log(`Successfully opened collection '${col.collectionName}'`);
 
@@ -140,7 +195,9 @@ export class DbManager
 
             console.log(`Successfully created a new entry in collection '${address}' with id ${result.insertedId}`);
 
-            this._publish('banana');
+            if (notifyPeers) {
+                this._sendToPeers({action: 'insertOne', name, publicKeyOwner, entry});
+            }
 
             return result;
         }
@@ -151,13 +208,13 @@ export class DbManager
     }
 
     // Find documents matching filter criteria
-    async find(name: string, publicKey: string, filter: Filter<Document>) {
+    async find(name: string, publicKeyOwner: string | null, filter: Filter<Document>) {
         if (!this._db) {
             console.log(`Attempt to find entries in collection '${name}' before connection`);
             return null;
         }
 
-        const address = `${name}:${publicKey}`;
+        const address = publicKeyOwner ? `${name}/${publicKeyOwner}` : name;
 
         try {
             const col = this._db.collection(address);
