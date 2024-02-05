@@ -4,6 +4,23 @@ import * as utils from '@noble/curves/abstract/utils';
 import * as net from 'net';
 import portfinder from 'portfinder';
 
+enum PeerMessageType {
+    PeerInfo,
+    PeerData
+}
+
+interface PeerMessage {
+    type: PeerMessageType
+}
+
+interface PeerInfoMessage extends PeerMessage {
+    listenerPort: number;
+}
+
+interface PeerDataMessage extends PeerMessage {
+    data: any;
+}
+
 function errorMessage(error: any) {
     return error.message ? error.message : 'Unknown error';
 }
@@ -13,7 +30,8 @@ export class DbManager
     private _db: Db | null = null;
     private _server: net.Server | null = null;
     private _serverPort: number = 0;
-    private _clients: Map<string, net.Socket> = new Map();
+    private _addressToSocket: Map<string, net.Socket> = new Map();
+    private _socketToAddress: Map<net.Socket, string> = new Map();
         
     async connect(dbAddress: string, peerAddresses: string[]) {
         const m = dbAddress.match(/(.*)\/(.*)\/?/);
@@ -40,13 +58,30 @@ export class DbManager
         this._serverPort = await portfinder.getPortPromise({port: 5000});
 
         this._server = net.createServer(socket => {
-            this._onPeerConnected(socket);
-
+            // New provisional connection from you to me (pending peer info)
             socket.on('data', msg => {
                 try {
                     const json = new TextDecoder().decode(msg);
-                    const obj = JSON.parse(json);
-                    this._onPeerReceived(obj)
+                    const peerMsg = JSON.parse(json) as PeerMessage;
+                    switch (peerMsg.type) {
+                        case PeerMessageType.PeerInfo:
+                            {
+                                // Confirmed connection from you to me
+                                const peerInfo = peerMsg as PeerInfoMessage;
+                                const address = `${socket.address}:${peerInfo.listenerPort}`
+                                this._onPeerConnected(address);
+                                this._addressToSocket.set(address, socket);
+                                this._socketToAddress.set(socket, address);
+                            }
+                            break;
+                        case PeerMessageType.PeerData:
+                            {
+                                // Data received
+                                const peerData = peerMsg as PeerDataMessage;
+                                this._onPeerReceived(peerData.data);
+                            }
+                            break;
+                    }
                 }
                 catch (error: any) {
                     console.log(error);
@@ -54,7 +89,13 @@ export class DbManager
             });
 
             socket.on('end', () => {
-                this._onPeerDisconnected(socket);
+                // Connection from you to me ended
+                const address = this._socketToAddress.get(socket);
+                if (address) {
+                    this._onPeerDisconnected(address);
+                    this._addressToSocket.delete(address);
+                    this._socketToAddress.delete(socket);
+                }
             });
 
             socket.on('error', console.log);
@@ -69,14 +110,14 @@ export class DbManager
     }
 
     async disconnect() {
-        for (const [_, socket] of this._clients) {
+        for (const [_, socket] of this._addressToSocket) {
             socket.end();
         }
         this._server?.close();
     };
 
     private _tryConnectToPeers(addresses: string[]) {
-        if (this._clients.size < addresses.length)
+        if (this._addressToSocket.size < addresses.length)
         {
             for (const address of addresses) {
                 this._tryConnectToPeer(address);
@@ -87,7 +128,7 @@ export class DbManager
     }
 
     private _tryConnectToPeer(address: string) {
-        if (this._clients.has(address)) {
+        if (this._addressToSocket.has(address)) {
             console.log(`Already connected to: ${address}`);
             return;
         }
@@ -98,13 +139,33 @@ export class DbManager
             return;
         }
         const socket = net.createConnection(port, host, () => {
-            this._onPeerConnected(socket);
-            this._clients.set(address, socket);
+            // New connection from me to you
+            const peerInfo: PeerInfoMessage = {
+                type: PeerMessageType.PeerInfo,
+                listenerPort: this._serverPort
+            };
+            socket.write(new TextEncoder().encode(JSON.stringify(peerInfo)));
+            this._onPeerConnected(address);
+            this._addressToSocket.set(address, socket);
+            this._socketToAddress.set(socket, address);
         });
 
         socket.on('close', () => {
-            this._onPeerDisconnected(socket);
-            this._clients.delete(address);
+            // Connection from me to you ended
+            this._onPeerDisconnected(address);
+            this._addressToSocket.delete(address);
+            this._socketToAddress.delete(socket)
+        });
+
+        socket.on('data', msg => {
+            try {
+                const json = new TextDecoder().decode(msg);
+                const obj = JSON.parse(json);
+                this._onPeerReceived(obj)
+            }
+            catch (error: any) {
+                console.log(error);
+            }
         });
 
         socket.on('error', console.log);
@@ -113,7 +174,7 @@ export class DbManager
     private _sendToPeers(obj: any) {
         const json = JSON.stringify(obj);
         const buffer = new TextEncoder().encode(json);
-        for (const [_, socket] of this._clients) {
+        for (const [_, socket] of this._addressToSocket) {
             socket.write(buffer);
         }
     }
@@ -122,12 +183,12 @@ export class DbManager
         console.log(`Listening for peers on port ${this._serverPort}`);
     }
 
-    private _onPeerConnected(socket: net.Socket) {
-        console.log(`Peer connected on port ${socket.localPort}/${socket.remotePort}`);
+    private _onPeerConnected(address: string) {
+        console.log(`Peer connected: ${address}`);
     }
 
-    private _onPeerDisconnected(socket: net.Socket) {
-        console.log('Peer disconnected');
+    private _onPeerDisconnected(address: string) {
+        console.log(`Peer disconnected: ${address}`);
     }
 
     private _onPeerReceived(obj: any) {
