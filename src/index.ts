@@ -6,7 +6,7 @@ import * as utils from '@noble/curves/abstract/utils';
 
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({extended: false}));
+app.use(express.urlencoded({ extended: false }));
 
 const dbManager = new DbManager();
 
@@ -39,12 +39,21 @@ app.get('/collection/:name', async (req, res) => {
 });
 
 (async () => {
-    const port = await portfinder.getPortPromise({port:3000});
+    const port = await portfinder.getPortPromise({ port: 3000 });
     app.listen(port, () => {
         console.log(`The http server is listening on port ${port}!`);
 
-        const peerAddresses = ['localhost:5000', 'localhost:5001'];
-        dbManager.connect(`mongodb://localhost:27017/music-${port}`, peerAddresses);
+        const selfAddress = '127.0.0.1';
+        const peerAddresses = [
+            '127.0.0.1:5001',
+            '127.0.0.1:5002',
+            '127.0.0.1:5003',
+            '127.0.0.1:5004',
+            '127.0.0.1:5005',
+            '127.0.0.1:5006',
+            '127.0.0.1:5007'];
+        const maxConnections = 2;
+        dbManager.connect(`mongodb://127.0.0.1:27017/music-${port}`, selfAddress, peerAddresses, maxConnections);
 
         // Client code examples...
 
@@ -83,6 +92,6 @@ async function onTerminate() {
     await dbManager.disconnect();
     process.exit(0);
 }
-  
-  process.on('SIGTERM', onTerminate);
-  process.on('SIGINT', onTerminate);
+
+process.on('SIGTERM', onTerminate);
+process.on('SIGINT', onTerminate);
