@@ -37,11 +37,19 @@ export class PubSub {
         this._onReceive = callback;
     }
 
-    sendToPeers(obj: any) {
-        const json = JSON.stringify(obj);
+    sendToPeers(obj: any, excludeAddresses: string[] = []) {
+        const peerDataMsg: PeerDataMessage = { type: PeerMessageType.PeerData, data: obj };
+        const json = JSON.stringify(peerDataMsg);
         const buffer = new TextEncoder().encode(json);
-        for (const [_, socket] of this._addressToSocket) {
-            socket.write(buffer);
+        const exclAddrSet = new Set(excludeAddresses);
+        for (const [address, socket] of this._addressToSocket) {
+            if (!exclAddrSet.has(address)) {
+                console.log(`Sending to peer: ${address}`)
+                socket.write(buffer);
+            }
+            else {
+                console.log(`Not sending to excluded peer: ${address}`)
+            }
         }
     }
 
@@ -49,7 +57,15 @@ export class PubSub {
         this._stopListeningForPeers();
     }
 
-    private _isSelfAddress(host: string) {
+    selfAddress(): string {
+        return `${this._serverAddress}:${this._serverPort}`;
+    }
+
+    cxnAddresses(): IterableIterator<string> {
+        return this._addressToSocket.keys();
+    }
+
+    private _isServerAddress(host: string) {
         return host == "localhost" || host == "127.0.0.1" || host == this._serverAddress;
     }
 
@@ -136,7 +152,7 @@ export class PubSub {
             return;
         }
 
-        if (this._isSelfAddress(host) && port == this._serverPort) {
+        if (this._isServerAddress(host) && port == this._serverPort) {
             console.log('Skipping attempt to connect to self');
             return;
         }
@@ -163,8 +179,12 @@ export class PubSub {
         socket.on('data', msg => {
             try {
                 const json = new TextDecoder().decode(msg);
-                const obj = JSON.parse(json);
-                this._onPeerReceived(obj)
+                const peerMsg = JSON.parse(json) as PeerMessage;
+                if (!peerMsg) {
+                    console.log('Received invalid message from peer');
+                    return;
+                }
+                this._onPeerMessage(peerMsg, socket);
             }
             catch (error: any) {
                 console.log(error);

@@ -1,7 +1,23 @@
-import { MongoClient, OptionalId, Filter, Document, Db } from 'mongodb';
+import { MongoClient, OptionalId, Filter, Document, Db, ObjectId, Collection } from 'mongodb';
 import { ed25519 } from '@noble/curves/ed25519';
 import * as utils from '@noble/curves/abstract/utils';
 import { PubSub } from './pub-sub';
+
+enum DbMessageType {
+    InsertOne
+}
+
+interface DbMessage {
+    action: DbMessageType;
+    excludeAddresses: string[];
+}
+
+interface DbMessageInsertOne extends DbMessage {
+    action: DbMessageType.InsertOne,
+    name: string;
+    publicKeyOwner: string | null;
+    entry: any;
+}
 
 function errorMessage(error: any) {
     return error.message ? error.message : 'Unknown error';
@@ -13,7 +29,7 @@ export class DbManager {
     private _pubSub: PubSub = new PubSub();
 
     constructor() {
-        this._pubSub.onReceive(this._onReceive);
+        this._pubSub.onReceive(obj => this._onReceive(obj));
     }
 
     async connect(dbAddress: string, selfAddress: string, peerAddresses: string[], maxConnections: number) {
@@ -61,35 +77,40 @@ export class DbManager {
     }
 
     private _onReceive(obj: any) {
-        switch (obj.action) {
-            case 'insertOne':
+        const dbMsg = obj as DbMessage;
+        switch (dbMsg.action) {
+            case DbMessageType.InsertOne:
                 {
-                    const { name, publicKey, entry } = obj;
-                    this.insertOne(name, publicKey, entry, false);
+                    const insertMsg = dbMsg as DbMessageInsertOne;
+                    this.insertOne(insertMsg.name, insertMsg.publicKeyOwner, insertMsg.entry, insertMsg.excludeAddresses);
                 }
                 break;
         }
     }
 
     // Insert single entry into collection with specified address
-    async insertOne(name: string, publicKeyOwner: string | null, entry: OptionalId<Document>, notifyPeers: boolean = true) {
+    async insertOne(name: string, publicKeyOwner: string | null, entry: OptionalId<Document>, excludeAddresses: string[] = []) {
+        // Check DB init
         if (!this._db) {
             console.log(`Attempt to insert entry into collection '${name}' before connection`);
             return null;
         }
 
-        if (!entry._id && entry._id != 0) {
-            console.log(`Attempt to insert entry into collection '${name}' without _id`);
+        // Check entry has an id
+        if (!entry._entryId && entry._entryId != 0) {
+            console.log(`Attempt to insert entry into collection '${name}' without _entryId`);
             return null;
         }
 
-        const id = entry._id.toString();
-        const publicKey = publicKeyOwner || (id.match(/^[0-9a-f]+\//) ? id.split('/')[0] : null);
+        // Check either collection or entry specifies the public key
+        const entryId = entry._entryId.toString();
+        const publicKey = publicKeyOwner || (entryId.match(/^[0-9a-f]+\//) ? entryId.split('/')[0] : null);
         if (!publicKey) {
             console.log(`Attempt to insert entry into public collection '${name}' without public key prefix on _id`);
             return null;
         }
 
+        // Validate signature
         try {
             if (!ed25519.verify(
                 entry._signature,
@@ -104,25 +125,44 @@ export class DbManager {
             return null;
         }
 
+        // Find collection
         const address = publicKeyOwner ? `${name}/${publicKeyOwner}` : name;
-
+        var col: Collection<Document>;
         try {
-            const col = this._db.collection(address);
-
+            col = this._db.collection(address);
             console.log(`Successfully opened collection '${col.collectionName}'`);
+            col.createIndex({ _entryId: 1 }, { unique: true, background: false });
+        }
+        catch {
+            console.log(`Failed to create index for collection ${address}`);
+            return null;
+        }
 
+        // Insert and send update to peers
+        try {
+            const originalEntry = { ...entry };
             const result = await col.insertOne(entry);
 
             if (!result) {
-                console.log('Failed to insert entry into the collection');
+                console.log(`Skipping insert of already-seen entry '${entryId}'`);
                 return null;
             }
 
             console.log(`Successfully created a new entry in collection '${address}' with id ${result.insertedId}`);
 
-            if (notifyPeers) {
-                this._pubSub.sendToPeers({ action: 'insertOne', name, publicKeyOwner, entry });
+            const excludeAddressesNext = Array.from(new Set(excludeAddresses.length > 0 ?
+                [...excludeAddresses, ...this._pubSub.cxnAddresses()] :
+                [this._pubSub.selfAddress(), ...this._pubSub.cxnAddresses()]));
+
+            const insertMsg: DbMessageInsertOne = {
+                action: DbMessageType.InsertOne,
+                excludeAddresses: excludeAddressesNext,
+                name,
+                publicKeyOwner,
+                entry: originalEntry
             }
+
+            this._pubSub.sendToPeers(insertMsg, excludeAddresses);
 
             return result;
         }
@@ -134,18 +174,19 @@ export class DbManager {
 
     // Find documents matching filter criteria
     async find(name: string, publicKeyOwner: string | null, filter: Filter<Document>) {
+        // Check DB init
         if (!this._db) {
             console.log(`Attempt to find entries in collection '${name}' before connection`);
             return null;
         }
 
+        // Find collection
         const address = publicKeyOwner ? `${name}/${publicKeyOwner}` : name;
+        const col = this._db.collection(address);
+        console.log(`Successfully opened collection '${col.collectionName}'`);
 
+        // Query and return results
         try {
-            const col = this._db.collection(address);
-
-            console.log(`Successfully opened collection '${col.collectionName}'`);
-
             const result = col.find(filter);
 
             console.log(`Successfully found results`);

@@ -73,7 +73,7 @@ app.get('/collection/:name', async (req, res) => {
 
         // Create a signed entry
         const entry = {
-            _id: 'bc1574acbd07cd903918b9dbed20936dedde9a8a34551cf3e932de527c881a17/0',
+            _entryId: 'bc1574acbd07cd903918b9dbed20936dedde9a8a34551cf3e932de527c881a17/0',
             _clock: 0,
             _signature: '',
             artist: 'Air',
